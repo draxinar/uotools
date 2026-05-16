@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install toolchain
+        run: dnf install -y git gcc make diffutils grep findutils perl-Digest-SHA clang-tools-extra
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: draxinar/uodemo
+          path: uodemo
+
+      - name: Stage testdata from checked-out uodemo
+        run: ln -s "$GITHUB_WORKSPACE/uodemo/rundir" "$GITHUB_WORKSPACE/wombat/testdata"
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test
