@@ -1356,9 +1356,15 @@ emit_id(FILE *f, CScriptStringDB *db, const char *name, RefBin *ref)
 
 /*
  * Write a T_STR token chain for a string literal.
- * If a reference binary is available, copies the T_STR chain from it
- * verbatim (preserving variant bytes, SDB indices, and chain structure).
- * Otherwise, looks up the string in SDB or adds a new entry.
+ *
+ * The source string is authoritative for the SDB index - same model as
+ * emit_id. When a reference binary is available we copy the variant byte
+ * from it for byte-identical re-encoding, but the SDB index always comes
+ * from looking up the source string. If the reference's first T_STR
+ * happens to point at the same string, we copy the rest of the chain
+ * verbatim too; otherwise we advance the reference past exactly one
+ * T_STR (so subsequent tokens stay aligned) and emit a fresh T_STR for
+ * the source string.
  */
 static void
 emit_str(FILE *f, CScriptStringDB *db, const char *str, RefBin *ref)
@@ -1366,47 +1372,68 @@ emit_str(FILE *f, CScriptStringDB *db, const char *str, RefBin *ref)
 	uint16_t v;
 	int idx;
 	uint16_t sdbidx;
+	int slen = strlen(str);
+	int ref_matches = 0;
 
-	/* With reference: copy the T_STR chain verbatim */
 	if (ref && ref->p + 4 <= ref->end &&
 	        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
+		uint16_t ridx;
+		const char *rs;
+		int rlen;
+		memcpy(&ridx, ref->p + 2, 2);
+		rs = CScriptStringDB_Get(db, ridx);
+		if (rs != NULL) {
+			rlen = strlen(rs);
+			if (rlen >= 2 && rlen - 2 == slen &&
+			        strncmp(str, rs + 1, slen) == 0)
+				ref_matches = 1;
+		}
+		if (ref_matches) {
+			/* Match: copy the whole chain verbatim. */
+			while (ref->p + 4 <= ref->end &&
+			        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
+				fwrite(ref->p, 4, 1, f);
+				ref->p += 4;
+			}
+			return;
+		}
+		/* Mismatch: copy the first T_STR's variant for re-encoding,
+		 * advance ref past the ENTIRE chain (so subsequent emits
+		 * don't see dangling T_STR tokens from the mismatched
+		 * reference structure), then fall through to emit a fresh
+		 * T_STR for the source string. */
+		memcpy(&v, ref->p, 2);
 		while (ref->p + 4 <= ref->end &&
 		        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
-			fwrite(ref->p, 4, 1, f);
 			ref->p += 4;
 		}
-		return;
+	} else {
+		v = g_TokenVariants[T_STR][0];
 	}
-
-	v = g_TokenVariants[T_STR][0];
 
 	/*
 	 * Find an SDB entry where the inner content matches str.
 	 * SDB entries are stored with surrounding quotes (e.g. "teleport").
 	 * The binary's T_STR handler does str + 1 to skip the first char.
 	 */
-	{
-		int slen = strlen(str);
-		for (idx = 0; idx < db->count; idx++) {
-			int elen;
-			if (db->strings[idx] == NULL)
-				continue;
-			elen = strlen(db->strings[idx]);
-			if (elen < 2)
-				continue;
-			if (elen - 2 == slen &&
-			        strncmp(str, db->strings[idx] + 1, slen) == 0) {
-				sdbidx = (uint16_t)idx;
-				fwrite(&v, 2, 1, f);
-				fwrite(&sdbidx, 2, 1, f);
-				return;
-			}
+	for (idx = 0; idx < db->count; idx++) {
+		int elen;
+		if (db->strings[idx] == NULL)
+			continue;
+		elen = strlen(db->strings[idx]);
+		if (elen < 2)
+			continue;
+		if (elen - 2 == slen &&
+		        strncmp(str, db->strings[idx] + 1, slen) == 0) {
+			sdbidx = (uint16_t)idx;
+			fwrite(&v, 2, 1, f);
+			fwrite(&sdbidx, 2, 1, f);
+			return;
 		}
 	}
 
 	/* String not found as a whole - add a new quoted SDB entry. */
 	{
-		int slen = strlen(str);
 		char *quoted = malloc(slen + 3);
 		if (quoted == NULL) {
 			fprintf(stderr, "wombat: cannot allocate SDB string\n");
