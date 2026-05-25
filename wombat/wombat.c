@@ -1358,13 +1358,13 @@ emit_id(FILE *f, CScriptStringDB *db, const char *name, RefBin *ref)
  * Write a T_STR token chain for a string literal.
  *
  * The source string is authoritative for the SDB index - same model as
- * emit_id. When a reference binary is available we copy the variant byte
- * from it for byte-identical re-encoding, but the SDB index always comes
- * from looking up the source string. If the reference's first T_STR
- * happens to point at the same string, we copy the rest of the chain
- * verbatim too; otherwise we advance the reference past exactly one
- * T_STR (so subsequent tokens stay aligned) and emit a fresh T_STR for
- * the source string.
+ * emit_id. When a reference binary is available and its T_STR chain
+ * decodes (per the binary's str+1 / trailing-quote-strip rule) to
+ * exactly the source string, we copy the chain verbatim for byte-
+ * identical re-encoding. Otherwise we advance the reference past the
+ * entire chain (so subsequent emits stay aligned), keep the first
+ * variant byte, and emit a fresh single-element T_STR using the SDB
+ * entry whose content matches the whole source string.
  */
 static void
 emit_str(FILE *f, CScriptStringDB *db, const char *str, RefBin *ref)
@@ -1373,23 +1373,41 @@ emit_str(FILE *f, CScriptStringDB *db, const char *str, RefBin *ref)
 	int idx;
 	uint16_t sdbidx;
 	int slen = strlen(str);
-	int ref_matches = 0;
 
 	if (ref && ref->p + 4 <= ref->end &&
 	        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
-		uint16_t ridx;
-		const char *rs;
-		int rlen;
-		memcpy(&ridx, ref->p + 2, 2);
-		rs = CScriptStringDB_Get(db, ridx);
-		if (rs != NULL) {
-			rlen = strlen(rs);
-			if (rlen >= 2 && rlen - 2 == slen &&
-			        strncmp(str, rs + 1, slen) == 0)
-				ref_matches = 1;
+		const char *chain_start = ref->p;
+		int chain_matches = 1;
+		int matched_len = 0;
+
+		while (ref->p + 4 <= ref->end &&
+		        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
+			uint16_t ridx;
+			const char *rs;
+			int rinner;
+			memcpy(&ridx, ref->p + 2, 2);
+			ref->p += 4;
+			rs = CScriptStringDB_Get(db, ridx);
+			if (rs == NULL || rs[0] == '\0')
+				continue;
+			/* Mirror decoder: skip first char, strip trailing '"'. */
+			rinner = strlen(rs) - 1;
+			if (rinner > 0 && rs[rinner] == '"')
+				rinner--;
+			if (!chain_matches)
+				continue;
+			if (rinner > slen - matched_len ||
+			        memcmp(str + matched_len, rs + 1, rinner) !=
+			                0) {
+				chain_matches = 0;
+				continue;
+			}
+			matched_len += rinner;
 		}
-		if (ref_matches) {
-			/* Match: copy the whole chain verbatim. */
+
+		if (chain_matches && matched_len == slen) {
+			/* Whole chain decodes to str: copy verbatim. */
+			ref->p = chain_start;
 			while (ref->p + 4 <= ref->end &&
 			        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
 				fwrite(ref->p, 4, 1, f);
@@ -1397,16 +1415,9 @@ emit_str(FILE *f, CScriptStringDB *db, const char *str, RefBin *ref)
 			}
 			return;
 		}
-		/* Mismatch: copy the first T_STR's variant for re-encoding,
-		 * advance ref past the ENTIRE chain (so subsequent emits
-		 * don't see dangling T_STR tokens from the mismatched
-		 * reference structure), then fall through to emit a fresh
-		 * T_STR for the source string. */
-		memcpy(&v, ref->p, 2);
-		while (ref->p + 4 <= ref->end &&
-		        ScriptTokenizer_MatchToken(ref->p, T_STR)) {
-			ref->p += 4;
-		}
+		/* Mismatch: keep the first variant for the fresh emit; ref
+		 * is already past the entire chain. */
+		memcpy(&v, chain_start, 2);
 	} else {
 		v = g_TokenVariants[T_STR][0];
 	}
