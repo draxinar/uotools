@@ -31,6 +31,15 @@ The `-s` flag specifies the string database file (sdb.txt), required
 for both encoding and decoding. The encoder automatically adds new
 strings and identifiers to the SDB and writes it back on success.
 
+### Comments
+
+Wombat source accepts C-style comments: `//` runs to the end of the
+line, and `/* ... */` spans lines (block comments do not nest). The
+encoder strips them while compiling, so commented and uncommented
+source produce byte-identical bytecode. Comments have no bytecode
+representation, so the decoder never emits them. Annotate the source,
+not the canonical decoded fixtures.
+
 ### Reference binary (-r)
 
 The original compiler randomly selects one of 5 variant encodings per

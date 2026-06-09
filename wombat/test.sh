@@ -185,6 +185,64 @@ for f in "$SCRIPTDIR"/*.m; do
 	fi
 done
 
+# Comment-stripping subtest (self-contained; uses a private SDB copy so the
+# canonical sdb.txt and the testdata fixtures are untouched). Proves the
+# encoder accepts C-style // and /* */ comments and strips them: the bytecode
+# for a commented script must be byte-identical to the same script without
+# comments. The URL string literal and the real "a / b" division exercise the
+# no-regression cases (// inside a string, lone / as division).
+cmt_ok=1
+cmt_sdb="$TMPDIR/cmt_sdb.txt"
+cp "$SDB" "$cmt_sdb"
+
+cat > "$TMPDIR/cmt_plain.m" <<'EOF'
+inherits itemmanip;
+
+trigger use {
+	int a = 0x0A;
+	int b = 0x02;
+	int c = a / b;
+	webBrowse(this, "http://www.owo.com/");
+	if (c > 0x00) {
+		barkTo(this, user, "ok");
+	}
+	return(0x00);
+}
+EOF
+
+cat > "$TMPDIR/cmt_commented.m" <<'EOF'
+// top-of-file line comment
+inherits itemmanip; // trailing line comment
+
+/* a single-line block comment */
+trigger use {
+	/* a block comment
+	   spanning multiple lines */
+	int a = 0x0A;
+	int b = 0x02;
+	int c = a /* inline block between tokens */ / b;
+	webBrowse(this, "http://www.owo.com/"); // // not a comment in the string
+	if (c > 0x00) {
+		barkTo(this, user, "ok");
+	}
+	return(0x00);
+}
+EOF
+
+if "$WOMBAT" -c -s "$cmt_sdb" "$TMPDIR/cmt_plain.m" "$TMPDIR/cmt_plain.bin" 2>/dev/null &&
+   "$WOMBAT" -c -s "$cmt_sdb" "$TMPDIR/cmt_commented.m" "$TMPDIR/cmt_commented.bin" 2>/dev/null; then
+	sha_plain=$(sha1sum "$TMPDIR/cmt_plain.bin" | cut -d' ' -f1)
+	sha_cmt=$(sha1sum "$TMPDIR/cmt_commented.bin" | cut -d' ' -f1)
+	if [ "$sha_plain" != "$sha_cmt" ]; then
+		echo "FAIL [comments]: commented bytecode differs from plain"
+		echo "  plain=$sha_plain commented=$sha_cmt"
+		cmt_ok=0
+	fi
+else
+	echo "FAIL [comments]: encode failed"
+	cmt_ok=0
+fi
+
 echo
 echo "=== Results ==="
 echo "  round-trip:    $pass/$total pass, $fail fail"
@@ -208,6 +266,12 @@ fi
 if [ "$ref_total" -gt 0 ]; then
 	echo "  ref match:     $ref_match/$ref_total"
 fi
+if [ "$cmt_ok" -eq 1 ]; then
+	echo "  comments:      ok (// and /* */ stripped; bytecode identical)"
+else
+	echo "  comments:      FAIL"
+fi
 
 [ "$fail" -eq 0 ] && [ "$bin_mismatch" -eq 0 ] && \
-[ "$nr_src_fail" -eq 0 ] && [ "$nr_bin_fail" -eq 0 ] && [ "$sdb_ok" -eq 1 ]
+[ "$nr_src_fail" -eq 0 ] && [ "$nr_bin_fail" -eq 0 ] && [ "$sdb_ok" -eq 1 ] && \
+[ "$cmt_ok" -eq 1 ]
