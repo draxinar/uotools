@@ -37,8 +37,27 @@ Wombat source accepts C-style comments: `//` runs to the end of the
 line, and `/* ... */` spans lines (block comments do not nest). The
 encoder strips them while compiling, so commented and uncommented
 source produce byte-identical bytecode. Comments have no bytecode
-representation, so the decoder never emits them. Annotate the source,
-not the canonical decoded fixtures.
+representation, so the decoder (`-d`) never emits them - use the
+formatter (`-f`) instead to canonicalize source while keeping comments.
+
+### Format (-f)
+
+```
+./wombat -f -s sdb.txt input.m output.m
+```
+
+Rewrites source text in the same canonical layout the decoder produces,
+while preserving comments in place. The non-comment skeleton is
+byte-identical to `-d` of the equivalent bytecode, so an already
+canonical (comment-free) file is reproduced unchanged and the formatter
+is idempotent. Integer literals are normalized to fixed-width hex, and a
+block comment in the middle of an expression is moved to its own line
+before the following token. `-f` is source-to-source: it never writes
+bytecode and never modifies sdb.txt.
+
+This is the canonicalization step for authoring: edit source, run
+`wombat -f`, and commit the result. Unlike re-decoding the compiled
+binary, it keeps your comments.
 
 ### Reference binary (-r)
 
@@ -66,10 +85,11 @@ to the originals.
 ```
 ./convert.sh -d [-s sdb.txt] srcdir dstdir
 ./convert.sh -c [-s sdb.txt] -r refdir srcdir dstdir
+./convert.sh -f [-s sdb.txt] srcdir dstdir
 ```
 
 If `-s` is omitted the script looks for `sdb.txt` next to the source
-directory (for `-d`) or the reference directory (for `-c`).
+directory (for `-d` and `-f`) or the reference directory (for `-c`).
 
 ## Testing
 

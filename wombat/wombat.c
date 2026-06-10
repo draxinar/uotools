@@ -740,6 +740,423 @@ emit_space(DecoderState *s)
 }
 
 /*
+ * Tool-only - no binary equivalent.
+ *
+ * Append n bytes to a growable heap buffer, keeping it NUL-terminated.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int
+buf_append(char **buf, size_t *len, size_t *cap, const char *data, size_t n)
+{
+	if (*len + n + 1 > *cap) {
+		size_t ncap;
+		char *nb;
+
+		ncap = *cap ? *cap : 256;
+		while (ncap < *len + n + 1)
+			ncap *= 2;
+		nb = realloc(*buf, ncap);
+		if (nb == NULL)
+			return -1;
+		*buf = nb;
+		*cap = ncap;
+	}
+	memcpy(*buf + *len, data, n);
+	*len += n;
+	(*buf)[*len] = '\0';
+	return 0;
+}
+
+/*
+ * Tool-only - no binary equivalent.
+ *
+ * Emit one already-decoded token in canonical layout, running the
+ * spacing/indent state machine over *s. The caller resolves the token
+ * value: strval carries the text for trigger names, for T_ID (an
+ * identifier or the "SDB_%d" fallback), and for T_STR (the raw inner
+ * content, re-escaped here); intval carries the inline integer for
+ * T_BYTE/T_WORD/T_DWORD, whose canonical hex width is fixed by the
+ * token type. peeknext is the type of the following token (or -1) and
+ * is consulted only to render "} else {". Shared by wombat_decode (the
+ * bytecode walk) and wombat_format (the source walk) so the two can
+ * never drift.
+ */
+static void
+decode_emit_token(DecoderState *s, int toktype, const char *strval,
+        uint32_t intval, int peeknext)
+{
+	FILE *fout = s->fout;
+	const char *text;
+	int i;
+
+	/* Variant and inline-integer tokens ignore strval; normalize the
+	 * NULL they pass so the string branches never feed fputs a null. */
+	if (strval == NULL)
+		strval = "";
+
+	/* Trigger event names (string-compared range 0x42..0x88). */
+	if (toktype >= 0x42 && toktype <= 0x88) {
+		flush_nl(s);
+		emit_space(s);
+		fputs(strval, fout);
+		s->prev = toktype;
+		s->col = 1;
+		return;
+	}
+
+	if (toktype == T_STR) {
+		int slen, j;
+
+		flush_nl(s);
+		emit_space(s);
+		fputc('"', fout);
+		if (strval != NULL) {
+			slen = (int)strlen(strval);
+			for (j = 0; j < slen; j++) {
+				if (strval[j] == '"' || strval[j] == '\\')
+					fputc('\\', fout);
+				fputc(strval[j], fout);
+			}
+		}
+		fputc('"', fout);
+		s->prev = T_STR;
+		s->col = 1;
+		return;
+	}
+
+	if (toktype == T_ID) {
+		flush_nl(s);
+		emit_space(s);
+		fputs(strval, fout);
+		s->prev = T_ID;
+		s->col = 1;
+		return;
+	}
+
+	if (toktype == T_BYTE || toktype == T_WORD || toktype == T_DWORD) {
+		int width;
+
+		width = toktype == T_BYTE ? 2 : toktype == T_WORD ? 4 : 8;
+		flush_nl(s);
+		emit_space(s);
+		fprintf(fout, "0x%0*X", width, (unsigned)intval);
+		if (s->prev == TK_CASE)
+			s->pending_nl = 1;
+		s->prev = toktype;
+		s->col = 1;
+		return;
+	}
+
+	text = NULL;
+	for (i = 0; g_TokenText[i].text != NULL; i++) {
+		if (g_TokenText[i].id == toktype) {
+			text = g_TokenText[i].text;
+			break;
+		}
+	}
+
+	if (text == NULL) {
+		flush_nl(s);
+		emit_space(s);
+		fprintf(fout, "?0x%02X", toktype);
+		s->prev = toktype;
+		s->col = 1;
+		return;
+	}
+
+	switch (toktype) {
+	case SM_SEMI:
+		if (s->paren_depth == 0)
+			flush_nl(s);
+		flush_indent(s);
+		fputs(";", fout);
+		if (s->paren_depth == 0)
+			s->pending_nl = 1;
+		s->prev = SM_SEMI;
+		s->col = 1;
+		break;
+
+	case SM_LBRACE:
+		flush_nl(s);
+		flush_indent(s);
+		if (s->col > 0)
+			fputc(' ', fout);
+		fputs("{", fout);
+		s->indent++;
+		s->pending_nl = 1;
+		s->prev = SM_LBRACE;
+		s->col = 1;
+		break;
+
+	case SM_RBRACE:
+		s->indent--;
+		if (s->indent < 0)
+			s->indent = 0;
+		if (s->pending_nl) {
+			s->pending_nl = 0;
+			fputc('\n', fout);
+			s->deferred_ind = s->indent;
+			s->col = 0;
+		}
+		flush_indent(s);
+
+		/* Check if next is 'else'-> } else { */
+		{
+			int next;
+
+			next = peeknext;
+			if (next == TK_ELSE) {
+				fputs("}", fout);
+				/* leave col=1, don't set
+				 * pending_nl; the 'else' case
+				 * will add space */
+			} else {
+				fputs("}", fout);
+				s->pending_nl = 1;
+			}
+		}
+		s->prev = SM_RBRACE;
+		s->col = 1;
+		break;
+
+	case SM_LPAREN:
+		flush_nl(s);
+		flush_indent(s);
+		/* Space before ( after keywords like
+		 * if/while/for. No space after identifier
+		 * (function call), switch, return, or trigger
+		 * event names. */
+		if (s->prev == TK_IF || s->prev == TK_WHILE ||
+		        s->prev == TK_FOR)
+			fputc(' ', fout);
+		else if (s->col > 0 && s->prev != T_ID &&
+		         s->prev != TK_SWITCH && s->prev != TK_RETURN &&
+		         !(s->prev >= 0x42 && s->prev <= 0x88) &&
+		         !no_space_after(s->prev))
+			fputc(' ', fout);
+		fputs("(", fout);
+		s->paren_depth++;
+		s->prev = SM_LPAREN;
+		s->col = 1;
+		break;
+
+	case SM_RPAREN:
+		flush_indent(s);
+		/* Space before ) after type keywords
+		 * (unnamed params in forward decls) or
+		 * trailing comma. */
+		if (s->prev == TK_INT || s->prev == TK_STRING ||
+		        s->prev == TK_USTRING || s->prev == TK_LOC ||
+		        s->prev == TK_OBJ || s->prev == TK_LIST ||
+		        s->prev == TK_VOID || s->prev == SM_COMMA)
+			fputc(' ', fout);
+		fputs(")", fout);
+		if (s->paren_depth > 0)
+			s->paren_depth--;
+		s->prev = SM_RPAREN;
+		s->col = 1;
+		break;
+
+	case SM_COMMA:
+		flush_indent(s);
+		/* Space before , after type keywords
+		 * (unnamed params in forward decls). */
+		if (s->prev == TK_INT || s->prev == TK_STRING ||
+		        s->prev == TK_USTRING || s->prev == TK_LOC ||
+		        s->prev == TK_OBJ || s->prev == TK_LIST ||
+		        s->prev == TK_VOID)
+			fputc(' ', fout);
+		fputs(",", fout);
+		s->prev = SM_COMMA;
+		s->col = 1;
+		break;
+
+	case SM_LBRACKET:
+		flush_indent(s);
+		fputs("[", fout);
+		s->prev = SM_LBRACKET;
+		s->col = 1;
+		break;
+
+	case SM_RBRACKET:
+		flush_indent(s);
+		fputs("]", fout);
+		s->prev = SM_RBRACKET;
+		s->col = 1;
+		break;
+
+	case OP_INC:
+	case OP_DEC:
+		flush_indent(s);
+		fputs(text, fout);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	case OP_NOT:
+		flush_nl(s);
+		emit_space(s);
+		fputs(text, fout);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	case OP_ADD:
+	case OP_SUB:
+	case OP_MUL:
+	case OP_DIV:
+	case OP_MOD:
+	case OP_ISEQ:
+	case OP_ISNEQ:
+	case OP_LT:
+	case OP_GT:
+	case OP_LTEQ:
+	case OP_GTEQ:
+	case OP_ASSIGN:
+	case OP_LOGAND:
+	case OP_LOGOR:
+	case OP_XOR:
+		flush_indent(s);
+		fprintf(fout, " %s", text);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	case TK_CASE:
+		/* case labels are outdented by 1
+		 * relative to the switch body. */
+		if (s->pending_nl) {
+			int ci;
+
+			ci = s->indent > 0 ? s->indent - 1 : 0;
+			fputc('\n', fout);
+			s->deferred_ind = ci;
+			s->pending_nl = 0;
+			s->col = 0;
+		}
+		flush_indent(s);
+		if (s->col > 0)
+			fputc(' ', fout);
+		fputs(text, fout);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	case TK_DEFAULT:
+		if (s->paren_depth > 0 || s->prev == TK_INT ||
+		        s->prev == TK_STRING || s->prev == TK_USTRING ||
+		        s->prev == TK_LOC || s->prev == TK_OBJ ||
+		        s->prev == TK_LIST || s->prev == TK_VOID) {
+			/* Variable name or expression */
+			flush_nl(s);
+			emit_space(s);
+			fputs(text, fout);
+		} else if (s->prev == T_BYTE || s->prev == T_WORD ||
+		           s->prev == T_DWORD) {
+			/* Combined case/default label -
+			 * emit at body indent */
+			if (s->pending_nl) {
+				fputc('\n', fout);
+				s->deferred_ind = s->indent;
+				s->pending_nl = 0;
+				s->col = 0;
+			}
+			flush_indent(s);
+			if (s->col > 0)
+				fputc(' ', fout);
+			fputs(text, fout);
+			s->pending_nl = 1;
+		} else {
+			/* Normal switch label - outdent */
+			if (s->pending_nl) {
+				int ci;
+
+				ci = s->indent > 0 ? s->indent - 1 : 0;
+				fputc('\n', fout);
+				s->deferred_ind = ci;
+				s->pending_nl = 0;
+				s->col = 0;
+			}
+			flush_indent(s);
+			if (s->col > 0)
+				fputc(' ', fout);
+			fputs(text, fout);
+			s->pending_nl = 1;
+		}
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	case TK_MEMBER:
+		/* Member declarations always appear at
+		 * indent 0 with a blank-line separator. */
+		if (s->pending_nl) {
+			fputc('\n', fout);
+			fputc('\n', fout);
+			s->deferred_ind = 0;
+			s->pending_nl = 0;
+			s->col = 0;
+		}
+		flush_indent(s);
+		fputs(text, fout);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+
+	default:
+		flush_nl_top(s, toktype);
+		emit_space(s);
+		fputs(text, fout);
+		s->prev = toktype;
+		s->col = 1;
+		break;
+	}
+}
+
+/*
+ * Tool-only - no binary equivalent.
+ *
+ * Emit a comment on its own line, hugging the token it precedes. Used by
+ * wombat_format for own-line (leading) comments and for block comments
+ * demoted out of the middle of an expression. next_toktype is the type of
+ * the following token so a comment before a top-level declaration picks up
+ * the same blank-line separator the declaration would.
+ */
+static void
+emit_leading_comment(DecoderState *s, const char *text, int next_toktype)
+{
+	if (s->pending_nl) {
+		flush_nl_top(s, next_toktype);
+	} else if (s->col > 0) {
+		/* Mid-line: force the comment onto its own line. */
+		fputc('\n', s->fout);
+		s->deferred_ind = s->indent;
+		s->col = 0;
+	}
+	flush_indent(s);
+	fputs(text, s->fout);
+	fputc('\n', s->fout);
+	s->deferred_ind = s->indent;
+	s->col = 0;
+	s->pending_nl = 0;
+}
+
+/*
+ * Tool-only - no binary equivalent.
+ *
+ * Emit a trailing comment on the current line, after the token it follows.
+ * A newline is left pending so the next token starts a fresh line.
+ */
+static void
+emit_trailing_comment(DecoderState *s, const char *text)
+{
+	fputc(' ', s->fout);
+	fputs(text, s->fout);
+	s->pending_nl = 1;
+	s->col = 1;
+}
+
+/*
  * wombat_decode - Tool-only. No binary equivalent.
  *
  * The binary's ScriptTokenizer_ReadToken (0x004283E4) emits token buffers
@@ -818,19 +1235,18 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 		if (toktype >= 0) {
 			int nlen;
 			int evtIdx;
+			const char *name;
 			nlen = strlen(g_TriggerNames[toktype]);
 			evtIdx = toktype - 0x42;
 
-			flush_nl(&s);
-			emit_space(&s);
 			if (evtIdx >= 0 &&
 			        evtIdx < (int)nelem(g_TriggerEventNames))
-				fputs(g_TriggerEventNames[evtIdx], fout);
+				name = g_TriggerEventNames[evtIdx];
 			else
-				fputs(g_TriggerNames[toktype], fout);
+				name = g_TriggerNames[toktype];
 			p += nlen;
-			s.prev = toktype;
-			s.col = 1;
+			decode_emit_token(
+			        &s, toktype, name, 0, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -849,13 +1265,14 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 		 * string entries start with 'L'.
 		 */
 		if (toktype == T_STR) {
+			char *buf;
+			size_t buflen, bufcap;
 			uint16_t idx;
 			const char *str;
 
-			flush_nl(&s);
-			emit_space(&s);
-			fputc('"', fout);
-
+			buf = NULL;
+			buflen = 0;
+			bufcap = 0;
 			while (p + 4 <= end &&
 			        ScriptTokenizer_MatchToken(p, T_STR)) {
 				p += 2;
@@ -870,28 +1287,29 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 					 * str + 1 unconditionally */
 					c = str + 1;
 
-					/* Strip trailing '"', escaping any
-					 * embedded quotes/backslashes */
+					/* Strip trailing '"'; embedded
+					 * quotes/backslashes are escaped on
+					 * emit. */
 					slen = strlen(c);
 					if (slen > 0 && c[slen - 1] == '"')
 						slen--;
-					for (int j = 0; j < slen; j++) {
-						if (c[j] == '"' || c[j] == '\\')
-							fputc('\\', fout);
-						fputc(c[j], fout);
-					}
+					if (slen > 0)
+						buf_append(&buf, &buflen,
+						        &bufcap, c,
+						        (size_t)slen);
 				}
 			}
 
-			fputc('"', fout);
-			s.prev = T_STR;
-			s.col = 1;
+			decode_emit_token(
+			        &s, T_STR, buf, 0, PeekTokenType(p, end));
+			free(buf);
 			continue;
 		}
 
 		if (toktype == T_ID) {
 			uint16_t idx;
 			const char *str;
+			char idbuf[32];
 
 			if (p + 4 > end)
 				break;
@@ -899,15 +1317,12 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 			memcpy(&idx, p, 2);
 			p += 2;
 			str = CScriptStringDB_Get(db, idx);
-
-			flush_nl(&s);
-			emit_space(&s);
-			if (str != NULL)
-				fputs(str, fout);
-			else
-				fprintf(fout, "SDB_%d", idx);
-			s.prev = T_ID;
-			s.col = 1;
+			if (str == NULL) {
+				snprintf(idbuf, sizeof(idbuf), "SDB_%d", idx);
+				str = idbuf;
+			}
+			decode_emit_token(
+			        &s, T_ID, str, 0, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -918,15 +1333,9 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 			if (p + 3 > end)
 				break;
 			val = (unsigned char)p[2];
-			flush_nl(&s);
-			emit_space(&s);
-			fprintf(fout, "0x%02X", val);
 			p += 3;
-			/* After case value, emit pending newline */
-			if (s.prev == TK_CASE)
-				s.pending_nl = 1;
-			s.prev = T_BYTE;
-			s.col = 1;
+			decode_emit_token(
+			        &s, T_BYTE, NULL, val, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -937,14 +1346,9 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 			if (p + 4 > end)
 				break;
 			memcpy(&val, p + 2, 2);
-			flush_nl(&s);
-			emit_space(&s);
-			fprintf(fout, "0x%04X", val);
 			p += 4;
-			if (s.prev == TK_CASE)
-				s.pending_nl = 1;
-			s.prev = T_WORD;
-			s.col = 1;
+			decode_emit_token(
+			        &s, T_WORD, NULL, val, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -955,14 +1359,9 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 			if (p + 6 > end)
 				break;
 			memcpy(&val, p + 2, 4);
-			flush_nl(&s);
-			emit_space(&s);
-			fprintf(fout, "0x%08X", val);
 			p += 6;
-			if (s.prev == TK_CASE)
-				s.pending_nl = 1;
-			s.prev = T_DWORD;
-			s.col = 1;
+			decode_emit_token(
+			        &s, T_DWORD, NULL, val, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -973,280 +1372,9 @@ wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db)
 		}
 
 		if (toktype >= 0) {
-			const char *text = NULL;
-			int i;
-
-			for (i = 0; g_TokenText[i].text != NULL; i++) {
-				if (g_TokenText[i].id == toktype) {
-					text = g_TokenText[i].text;
-					break;
-				}
-			}
-
 			p += 2;
-
-			if (text == NULL) {
-				flush_nl(&s);
-				emit_space(&s);
-				fprintf(fout, "?0x%02X", toktype);
-				s.prev = toktype;
-				s.col = 1;
-				continue;
-			}
-
-			switch (toktype) {
-			case SM_SEMI:
-				if (s.paren_depth == 0)
-					flush_nl(&s);
-				flush_indent(&s);
-				fputs(";", fout);
-				if (s.paren_depth == 0)
-					s.pending_nl = 1;
-				s.prev = SM_SEMI;
-				s.col = 1;
-				break;
-
-			case SM_LBRACE:
-				flush_nl(&s);
-				flush_indent(&s);
-				if (s.col > 0)
-					fputc(' ', fout);
-				fputs("{", fout);
-				s.indent++;
-				s.pending_nl = 1;
-				s.prev = SM_LBRACE;
-				s.col = 1;
-				break;
-
-			case SM_RBRACE:
-				s.indent--;
-				if (s.indent < 0)
-					s.indent = 0;
-				if (s.pending_nl) {
-					s.pending_nl = 0;
-					fputc('\n', fout);
-					s.deferred_ind = s.indent;
-					s.col = 0;
-				}
-				flush_indent(&s);
-
-				/* Check if next is 'else'-> } else { */
-				{
-					int next;
-
-					next = PeekTokenType(p, end);
-					if (next == TK_ELSE) {
-						fputs("}", fout);
-						/* leave col=1, don't set
-						 * pending_nl; the 'else' case
-						 * will add space */
-					} else {
-						fputs("}", fout);
-						s.pending_nl = 1;
-					}
-				}
-				s.prev = SM_RBRACE;
-				s.col = 1;
-				break;
-
-			case SM_LPAREN:
-				flush_nl(&s);
-				flush_indent(&s);
-				/* Space before ( after keywords like
-				 * if/while/for. No space after identifier
-				 * (function call), switch, return, or trigger
-				 * event names. */
-				if (s.prev == TK_IF || s.prev == TK_WHILE ||
-				        s.prev == TK_FOR)
-					fputc(' ', fout);
-				else if (s.col > 0 && s.prev != T_ID &&
-				         s.prev != TK_SWITCH &&
-				         s.prev != TK_RETURN &&
-				         !(s.prev >= 0x42 && s.prev <= 0x88) &&
-				         !no_space_after(s.prev))
-					fputc(' ', fout);
-				fputs("(", fout);
-				s.paren_depth++;
-				s.prev = SM_LPAREN;
-				s.col = 1;
-				break;
-
-			case SM_RPAREN:
-				flush_indent(&s);
-				/* Space before ) after type keywords
-				 * (unnamed params in forward decls) or
-				 * trailing comma. */
-				if (s.prev == TK_INT || s.prev == TK_STRING ||
-				        s.prev == TK_USTRING ||
-				        s.prev == TK_LOC || s.prev == TK_OBJ ||
-				        s.prev == TK_LIST ||
-				        s.prev == TK_VOID || s.prev == SM_COMMA)
-					fputc(' ', fout);
-				fputs(")", fout);
-				if (s.paren_depth > 0)
-					s.paren_depth--;
-				s.prev = SM_RPAREN;
-				s.col = 1;
-				break;
-
-			case SM_COMMA:
-				flush_indent(&s);
-				/* Space before , after type keywords
-				 * (unnamed params in forward decls). */
-				if (s.prev == TK_INT || s.prev == TK_STRING ||
-				        s.prev == TK_USTRING ||
-				        s.prev == TK_LOC || s.prev == TK_OBJ ||
-				        s.prev == TK_LIST || s.prev == TK_VOID)
-					fputc(' ', fout);
-				fputs(",", fout);
-				s.prev = SM_COMMA;
-				s.col = 1;
-				break;
-
-			case SM_LBRACKET:
-				flush_indent(&s);
-				fputs("[", fout);
-				s.prev = SM_LBRACKET;
-				s.col = 1;
-				break;
-
-			case SM_RBRACKET:
-				flush_indent(&s);
-				fputs("]", fout);
-				s.prev = SM_RBRACKET;
-				s.col = 1;
-				break;
-
-			case OP_INC:
-			case OP_DEC:
-				flush_indent(&s);
-				fputs(text, fout);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			case OP_NOT:
-				flush_nl(&s);
-				emit_space(&s);
-				fputs(text, fout);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			case OP_ADD:
-			case OP_SUB:
-			case OP_MUL:
-			case OP_DIV:
-			case OP_MOD:
-			case OP_ISEQ:
-			case OP_ISNEQ:
-			case OP_LT:
-			case OP_GT:
-			case OP_LTEQ:
-			case OP_GTEQ:
-			case OP_ASSIGN:
-			case OP_LOGAND:
-			case OP_LOGOR:
-			case OP_XOR:
-				flush_indent(&s);
-				fprintf(fout, " %s", text);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			case TK_CASE:
-				/* case labels are outdented by 1
-				 * relative to the switch body. */
-				if (s.pending_nl) {
-					int ci;
-
-					ci = s.indent > 0 ? s.indent - 1 : 0;
-					fputc('\n', fout);
-					s.deferred_ind = ci;
-					s.pending_nl = 0;
-					s.col = 0;
-				}
-				flush_indent(&s);
-				if (s.col > 0)
-					fputc(' ', fout);
-				fputs(text, fout);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			case TK_DEFAULT:
-				if (s.paren_depth > 0 || s.prev == TK_INT ||
-				        s.prev == TK_STRING ||
-				        s.prev == TK_USTRING ||
-				        s.prev == TK_LOC || s.prev == TK_OBJ ||
-				        s.prev == TK_LIST ||
-				        s.prev == TK_VOID) {
-					/* Variable name or expression */
-					flush_nl(&s);
-					emit_space(&s);
-					fputs(text, fout);
-				} else if (s.prev == T_BYTE ||
-				           s.prev == T_WORD ||
-				           s.prev == T_DWORD) {
-					/* Combined case/default label -
-					 * emit at body indent */
-					if (s.pending_nl) {
-						fputc('\n', fout);
-						s.deferred_ind = s.indent;
-						s.pending_nl = 0;
-						s.col = 0;
-					}
-					flush_indent(&s);
-					if (s.col > 0)
-						fputc(' ', fout);
-					fputs(text, fout);
-					s.pending_nl = 1;
-				} else {
-					/* Normal switch label - outdent */
-					if (s.pending_nl) {
-						int ci;
-
-						ci = s.indent > 0 ? s.indent - 1
-						                  : 0;
-						fputc('\n', fout);
-						s.deferred_ind = ci;
-						s.pending_nl = 0;
-						s.col = 0;
-					}
-					flush_indent(&s);
-					if (s.col > 0)
-						fputc(' ', fout);
-					fputs(text, fout);
-					s.pending_nl = 1;
-				}
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			case TK_MEMBER:
-				/* Member declarations always appear at
-				 * indent 0 with a blank-line separator. */
-				if (s.pending_nl) {
-					fputc('\n', fout);
-					fputc('\n', fout);
-					s.deferred_ind = 0;
-					s.pending_nl = 0;
-					s.col = 0;
-				}
-				flush_indent(&s);
-				fputs(text, fout);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-
-			default:
-				flush_nl_top(&s, toktype);
-				emit_space(&s);
-				fputs(text, fout);
-				s.prev = toktype;
-				s.col = 1;
-				break;
-			}
+			decode_emit_token(
+			        &s, toktype, NULL, 0, PeekTokenType(p, end));
 			continue;
 		}
 
@@ -1530,6 +1658,23 @@ emit_int(FILE *f, uint32_t val, int hexdigits, RefBin *ref)
 }
 
 /*
+ * Tool-only - no binary equivalent.
+ *
+ * A captured source comment and where it sits in the token stream. anchor
+ * is the index of the token the comment precedes; nl_before/nl_after note
+ * whether a newline separated it from the previous and next tokens, which
+ * wombat_format uses to choose trailing (end of a code line) vs leading
+ * (its own line) placement.
+ */
+typedef struct Comment Comment;
+struct Comment {
+	char *text;
+	int anchor;
+	int nl_before;
+	int nl_after;
+};
+
+/*
  * Simple tokenizer for Wombat source text
  */
 typedef struct Lexer Lexer;
@@ -1537,7 +1682,46 @@ struct Lexer {
 	const char *p;
 	const char *end;
 	char tok[4096]; /* current token text */
+	int capture; /* nonzero: record comments for wombat_format */
+	int tokindex; /* tokens returned so far (comment anchor) */
+	Comment *cmts;
+	int ncmt;
+	int capcmt;
 };
+
+/*
+ * Tool-only - no binary equivalent.
+ *
+ * Record a comment spanning [start, end) at the current token boundary.
+ * Returns the new comment's index, or -1 on allocation failure (the
+ * comment is then dropped).
+ */
+static int
+lexer_add_comment(Lexer *l, const char *start, const char *end, int nl_before)
+{
+	Comment *c;
+	size_t n;
+
+	if (l->ncmt >= l->capcmt) {
+		int ncap = l->capcmt ? l->capcmt * 2 : 16;
+		Comment *nc = realloc(l->cmts, (size_t)ncap * sizeof(*nc));
+		if (nc == NULL)
+			return -1;
+		l->cmts = nc;
+		l->capcmt = ncap;
+	}
+	n = (size_t)(end - start);
+	c = &l->cmts[l->ncmt];
+	c->text = malloc(n + 1);
+	if (c->text == NULL)
+		return -1;
+	memcpy(c->text, start, n);
+	c->text[n] = '\0';
+	c->anchor = l->tokindex;
+	c->nl_before = nl_before;
+	c->nl_after = 0;
+	return l->ncmt++;
+}
 
 /*
  * Tool-only - no binary equivalent.
@@ -1547,24 +1731,45 @@ struct Lexer {
  * here at compile time and never regenerated by the decoder. "//" runs to
  * end of line; the block form spans lines and does not nest. The original
  * UoDemo.exe never compiled source text, so it had no source lexer.
+ *
+ * When l->capture is set (wombat_format), each comment is also recorded
+ * with the newline context needed to place it again on output.
  */
 static void
 skip_ws(Lexer *l)
 {
+	int nl = l->tokindex == 0; /* start of file counts as own line */
+	int last = -1; /* index of the last comment recorded here */
+
 	for (;;) {
-		while (l->p < l->end && isspace((unsigned char)*l->p))
+		while (l->p < l->end && isspace((unsigned char)*l->p)) {
+			if (*l->p == '\n')
+				nl = 1;
 			l->p++;
+		}
+		if (nl && last >= 0)
+			l->cmts[last].nl_after = 1;
 
 		// "//" line comment: skip to end of line
 		if (l->p + 1 < l->end && l->p[0] == '/' && l->p[1] == '/') {
+			const char *start = l->p;
 			l->p += 2;
 			while (l->p < l->end && *l->p != '\n')
 				l->p++;
+			if (l->capture) {
+				const char *stop = l->p;
+				while (stop > start + 2 &&
+				        (stop[-1] == ' ' || stop[-1] == '\t'))
+					stop--;
+				last = lexer_add_comment(l, start, stop, nl);
+			}
+			nl = 0;
 			continue;
 		}
 
 		// block comment: skip to the closing marker (no nesting)
 		if (l->p + 1 < l->end && l->p[0] == '/' && l->p[1] == '*') {
+			const char *start = l->p;
 			l->p += 2;
 			while (l->p + 1 < l->end &&
 			        !(l->p[0] == '*' && l->p[1] == '/'))
@@ -1573,6 +1778,9 @@ skip_ws(Lexer *l)
 				l->p += 2; // consume closing marker
 			else
 				l->p = l->end; // unterminated: run to EOF
+			if (l->capture)
+				last = lexer_add_comment(l, start, l->p, nl);
+			nl = 0;
 			continue;
 		}
 
@@ -1793,6 +2001,7 @@ wombat_encode(const char *inpath, const char *outpath, CScriptStringDB *db,
 		return 1;
 	}
 
+	memset(&lex, 0, sizeof(lex));
 	lex.p = data;
 	lex.end = data + len;
 
@@ -1868,4 +2077,190 @@ wombat_encode(const char *inpath, const char *outpath, CScriptStringDB *db,
 	free(data);
 	free((char *)refbin.data);
 	return 0;
+}
+
+/*
+ * wombat_format - Tool-only. No binary equivalent.
+ *
+ * Rewrites Wombat source text in the decoder's canonical layout while
+ * preserving comments. The non-comment skeleton is produced by the same
+ * decode_emit_token state machine wombat_decode uses, so an already
+ * canonical (comment-free) file is reproduced byte-for-byte and the
+ * formatter is idempotent. No bytecode is generated and the SDB is never
+ * consulted, so sdb.txt is left untouched.
+ *
+ * Integer literals are renormalized to fixed-width hex; a block comment
+ * sitting in the middle of an expression is moved to its own line before
+ * the following token, since the spacing state machine has no inline slot
+ * for it.
+ *
+ * Returns 0 on success, non-zero on error.
+ */
+int
+wombat_format(const char *inpath, const char *outpath, CScriptStringDB *db)
+{
+	FILE *fin, *fout;
+	char *data;
+	long len;
+	Lexer lex;
+	DecoderState s;
+	struct FmtTok {
+		int toktype;
+		uint32_t intval;
+		char *strval;
+	} *toks;
+	int ntok, captok;
+	int i, ci;
+	int rc;
+
+	(void)db; /* the source walk carries its own strings; no SDB lookups */
+
+	fin = fopen(inpath, "r");
+	if (fin == NULL) {
+		fprintf(stderr, "wombat: cannot open %s\n", inpath);
+		return 1;
+	}
+	fseek(fin, 0, SEEK_END);
+	len = ftell(fin);
+	fseek(fin, 0, SEEK_SET);
+	if (len < 0) {
+		fclose(fin);
+		fprintf(stderr, "wombat: cannot size %s\n", inpath);
+		return 1;
+	}
+	data = malloc((size_t)len + 1);
+	if (data == NULL) {
+		fclose(fin);
+		return 1;
+	}
+	if (fread(data, 1, (size_t)len, fin) != (size_t)len) {
+		free(data);
+		fclose(fin);
+		fprintf(stderr, "wombat: short read on %s\n", inpath);
+		return 1;
+	}
+	data[len] = '\0';
+	fclose(fin);
+
+	memset(&lex, 0, sizeof(lex));
+	lex.p = data;
+	lex.end = data + len;
+	lex.capture = 1;
+
+	/* Pass 1: lex into a token array, classifying each token exactly as
+	 * wombat_encode does; comments accumulate in the lexer. */
+	toks = NULL;
+	ntok = 0;
+	captok = 0;
+	rc = 0;
+	while (lex_next(&lex)) {
+		int tt = T_ID;
+		uint32_t val = 0;
+		char *sv = NULL;
+
+		if (lex.tok[0] == '"') {
+			tt = T_STR;
+			sv = strdup(lex.tok + 1);
+		} else if (isdigit((unsigned char)lex.tok[0])) {
+			int hexdigits = 0;
+			if (lex.tok[0] == '0' &&
+			        (lex.tok[1] == 'x' || lex.tok[1] == 'X')) {
+				val = (uint32_t)strtoul(lex.tok, NULL, 16);
+				hexdigits = (int)strlen(lex.tok + 2);
+			} else {
+				val = (uint32_t)strtoul(lex.tok, NULL, 10);
+			}
+			if (hexdigits >= 8 || val > 0xFFFF)
+				tt = T_DWORD;
+			else if (hexdigits >= 4 || val > 0xFF)
+				tt = T_WORD;
+			else
+				tt = T_BYTE;
+		} else if ((tt = text_to_tokentype(lex.tok)) >= 0) {
+			sv = NULL;
+		} else {
+			tt = T_ID;
+			sv = strdup(lex.tok);
+		}
+
+		if (ntok >= captok) {
+			int ncap = captok ? captok * 2 : 64;
+			struct FmtTok *nt;
+			nt = realloc(toks, (size_t)ncap * sizeof(*nt));
+			if (nt == NULL) {
+				free(sv);
+				rc = 1;
+				break;
+			}
+			toks = nt;
+			captok = ncap;
+		}
+		toks[ntok].toktype = tt;
+		toks[ntok].intval = val;
+		toks[ntok].strval = sv;
+		ntok++;
+		lex.tokindex++;
+	}
+
+	fout = NULL;
+	if (rc == 0) {
+		fout = fopen(outpath, "w");
+		if (fout == NULL) {
+			fprintf(stderr, "wombat: cannot create %s\n", outpath);
+			rc = 1;
+		}
+	}
+
+	if (rc == 0) {
+		s.fout = fout;
+		s.indent = 0;
+		s.prev = -1;
+		s.pending_nl = 0;
+		s.col = 0;
+		s.paren_depth = 0;
+		s.deferred_ind = -1;
+
+		/* Pass 2: emit tokens, interleaving captured comments. In the
+		 * gap before token i, comments share anchor i; a trailing one
+		 * follows token i-1 on its line, a leading one gets its own
+		 * line before token i. */
+		ci = 0;
+		for (i = 0; i < ntok; i++) {
+			while (ci < lex.ncmt && lex.cmts[ci].anchor == i) {
+				Comment *c = &lex.cmts[ci];
+				if (!c->nl_before && c->nl_after)
+					emit_trailing_comment(&s, c->text);
+				else
+					emit_leading_comment(
+					        &s, c->text, toks[i].toktype);
+				ci++;
+			}
+			decode_emit_token(&s, toks[i].toktype, toks[i].strval,
+			        toks[i].intval,
+			        i + 1 < ntok ? toks[i + 1].toktype : -1);
+		}
+		/* Comments after the last token (anchor == ntok). */
+		while (ci < lex.ncmt) {
+			Comment *c = &lex.cmts[ci];
+			if (!c->nl_before)
+				emit_trailing_comment(&s, c->text);
+			else
+				emit_leading_comment(&s, c->text, -1);
+			ci++;
+		}
+		if (s.col > 0)
+			fputc('\n', fout);
+	}
+
+	if (fout != NULL)
+		fclose(fout);
+
+	for (i = 0; i < ntok; i++)
+		free(toks[i].strval);
+	free(toks);
+	for (i = 0; i < lex.ncmt; i++)
+		free(lex.cmts[i].text);
+	free(lex.cmts);
+	free(data);
+	return rc;
 }

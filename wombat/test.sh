@@ -243,6 +243,88 @@ else
 	cmt_ok=0
 fi
 
+# Formatter (-f) subtest. Self-contained; uses a private SDB copy so the
+# canonical sdb.txt and the fixtures stay untouched. Proves three things:
+# -f is a no-op on canonical (comment-free) source, it preserves comments
+# and is idempotent, and it never perturbs the compiled bytecode.
+fmt_ok=1
+fmt_sdb="$TMPDIR/fmt_sdb.txt"
+cp "$SDB" "$fmt_sdb"
+
+# (a) no-op on canonical: every decoded1 file is decode(binary), i.e.
+# already canonical, so -f must reproduce it byte-for-byte.
+fmt_noop_fail=0
+for f in "$TMPDIR/decoded1"/*.m; do
+	[ -f "$f" ] || continue
+	base="$(basename "$f")"
+	if "$WOMBAT" -f -s "$fmt_sdb" "$f" "$TMPDIR/fmt_noop.m" 2>/dev/null; then
+		if ! cmp -s "$TMPDIR/fmt_noop.m" "$f"; then
+			fmt_noop_fail=$((fmt_noop_fail + 1))
+			if [ "$fmt_noop_fail" -eq 1 ]; then
+				echo "FAIL [format-canon]: $base"
+				diff -u "$f" "$TMPDIR/fmt_noop.m" | head -20
+			fi
+		fi
+	else
+		fmt_noop_fail=$((fmt_noop_fail + 1))
+	fi
+done
+if [ "$fmt_noop_fail" -ne 0 ]; then
+	echo "  format-canon failures: $fmt_noop_fail"
+	fmt_ok=0
+fi
+
+# (b) comment preservation + idempotence on a messy commented source.
+cat > "$TMPDIR/fmt_messy.m" <<'EOF'
+// top-of-file line comment
+inherits   itemmanip;// trailing line comment
+/* a single-line block comment */
+trigger use{
+/* a block comment
+   spanning multiple lines */
+int a=10;
+   int b =0x2;
+int c = a /* inline block between tokens */ / b;
+webBrowse( this,"http://www.owo.com/" );// // not a comment in the string
+if(c>0){barkTo(this,user,"ok");}
+return(0);
+}
+EOF
+if "$WOMBAT" -f -s "$fmt_sdb" "$TMPDIR/fmt_messy.m" "$TMPDIR/fmt_1.m" 2>/dev/null &&
+   "$WOMBAT" -f -s "$fmt_sdb" "$TMPDIR/fmt_1.m" "$TMPDIR/fmt_2.m" 2>/dev/null; then
+	if ! cmp -s "$TMPDIR/fmt_1.m" "$TMPDIR/fmt_2.m"; then
+		echo "FAIL [format-idem]: -f is not idempotent on commented source"
+		diff -u "$TMPDIR/fmt_1.m" "$TMPDIR/fmt_2.m" | head -20
+		fmt_ok=0
+	fi
+	for marker in "// top-of-file line comment" "// trailing line comment" \
+	              "/* a single-line block comment */" "spanning multiple lines" \
+	              "// // not a comment in the string"; do
+		if ! grep -qF "$marker" "$TMPDIR/fmt_1.m"; then
+			echo "FAIL [format-comments]: lost comment: $marker"
+			fmt_ok=0
+		fi
+	done
+else
+	echo "FAIL [format-idem]: -f failed on commented source"
+	fmt_ok=0
+fi
+
+# (c) bytecode invariance: encoding the messy source and its formatted form
+# must produce identical bytecode (comments and layout never reach bytecode).
+cp "$SDB" "$TMPDIR/fmt_enc_a.txt"
+cp "$SDB" "$TMPDIR/fmt_enc_b.txt"
+if "$WOMBAT" -c -s "$TMPDIR/fmt_enc_a.txt" "$TMPDIR/fmt_messy.m" "$TMPDIR/fmt_messy.bin" 2>/dev/null &&
+   "$WOMBAT" -c -s "$TMPDIR/fmt_enc_b.txt" "$TMPDIR/fmt_1.m" "$TMPDIR/fmt_fmt.bin" 2>/dev/null; then
+	if ! cmp -s "$TMPDIR/fmt_messy.bin" "$TMPDIR/fmt_fmt.bin"; then
+		echo "FAIL [format-bin]: formatted bytecode differs from source"
+		fmt_ok=0
+	fi
+else
+	echo "FAIL [format-bin]: encode failed"
+	fmt_ok=0
+fi
+
 echo
 echo "=== Results ==="
 echo "  round-trip:    $pass/$total pass, $fail fail"
@@ -271,7 +353,12 @@ if [ "$cmt_ok" -eq 1 ]; then
 else
 	echo "  comments:      FAIL"
 fi
+if [ "$fmt_ok" -eq 1 ]; then
+	echo "  format:        ok (-f no-op on canonical, comments kept, idempotent)"
+else
+	echo "  format:        FAIL"
+fi
 
 [ "$fail" -eq 0 ] && [ "$bin_mismatch" -eq 0 ] && \
 [ "$nr_src_fail" -eq 0 ] && [ "$nr_bin_fail" -eq 0 ] && [ "$sdb_ok" -eq 1 ] && \
-[ "$cmt_ok" -eq 1 ]
+[ "$cmt_ok" -eq 1 ] && [ "$fmt_ok" -eq 1 ]

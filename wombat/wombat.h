@@ -217,6 +217,16 @@ void CScriptStringDB_Free(CScriptStringDB *db);
 int wombat_decode(const char *inpath, const char *outpath, CScriptStringDB *db);
 
 /*
+ * Format Wombat source text into the decoder's canonical layout while
+ * preserving comments. Tool-only - no binary equivalent.
+ *
+ * Source-to-source: no bytecode is produced and the SDB is not modified.
+ * The non-comment output matches wombat_decode, so the formatter is
+ * idempotent. Returns 0 on success, non-zero on error.
+ */
+int wombat_format(const char *inpath, const char *outpath, CScriptStringDB *db);
+
+/*
  * Encode Wombat source text to compiled .m bytecode.
  * Tool-only - no binary equivalent.
  *

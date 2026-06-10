@@ -12,13 +12,16 @@ usage(FILE *out, int code)
 	fprintf(out,
 	        "usage: %s -d [-s sdb.txt] input.m output.m\n"
 	        "       %s -c [-s sdb.txt] [-r ref.m] input.m output.m\n"
+	        "       %s -f [-s sdb.txt] input.m output.m\n"
 	        "\n"
 	        "  -d    decode bytecode to text\n"
 	        "  -c    encode text to bytecode\n"
+	        "  -f    format source text to canonical layout (keeps "
+	        "comments)\n"
 	        "  -s    path to sdb.txt (default: sdb.txt)\n"
 	        "  -r    reference binary for variant-preserving re-encode\n"
 	        "  -h    show this help and exit\n",
-	        argv0, argv0);
+	        argv0, argv0, argv0);
 	exit(code);
 }
 
@@ -48,6 +51,8 @@ main(int argc, char *argv[])
 			mode = 'd';
 		else if (strncmp(argv[0], "-c", 2) == 0)
 			mode = 'c';
+		else if (strncmp(argv[0], "-f", 2) == 0)
+			mode = 'f';
 		else if (strncmp(argv[0], "-h", 2) == 0)
 			usage(stdout, 0);
 		else if (strncmp(argv[0], "-s", 2) == 0) {
@@ -81,6 +86,8 @@ main(int argc, char *argv[])
 
 	if (mode == 'd')
 		ret = wombat_decode(inpath, outpath, &db);
+	else if (mode == 'f')
+		ret = wombat_format(inpath, outpath, &db);
 	else {
 		int old_count = db.count;
 		ret = wombat_encode(inpath, outpath, &db, refpath);
